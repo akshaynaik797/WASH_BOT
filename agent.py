@@ -1,257 +1,186 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-from dotenv import load_dotenv
 import os
+import logging
+from functools import lru_cache
+from dotenv import load_dotenv
+from typing import List, Dict, Optional
 
-# Load .env file (for local development)
+from langchain_groq import ChatGroq
+from langchain.schema import Document
+from langchain.prompts import PromptTemplate
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+
+from tavily import TavilyClient
+
+# ----------------------------------------------------
+# ENVIRONMENT & LOGGING
+# ----------------------------------------------------
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("WASH-Agent")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-if not GROQ_API_KEY:
-    raise ValueError("Missing GROQ_API_KEY in environment variables!")
-
-if not HF_TOKEN:
-    raise ValueError("Missing HF_TOKEN in environment variables!")
-
-if not TAVILY_API_KEY:
-    raise ValueError("Missing TAVILY_API_KEY in environment variables!")
-
-import json
-from langchain_groq import ChatGroq
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langgraph.prebuilt import create_react_agent
-from langchain_core.messages.ai import AIMessage
-from sklearn.metrics.pairwise import cosine_similarity
-from langchain_core.messages import HumanMessage
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-import numpy as np
-from langchain.tools import tool, Tool
-
-# Initialize Groq LLM and search tool
-groq_llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
-search_tool = TavilySearchResults(tavily_api_key=TAVILY_API_KEY, max_results=2)
-
-# Define WASH sector domain keywords and topics
+# ----------------------------------------------------
+# DOMAIN KNOWLEDGE
+# ----------------------------------------------------
 WASH_DOMAINS = [
-    "sanitation", "hygiene", "wash", "water sanitation hygiene", 
-    "toilet", "handwashing", "clean water", "waste management",
-    "sewage", "wastewater", "public health", "waterborne diseases",
-    "open defecation", "sanitation facilities", "hygiene promotion",
-    "water supply", "water treatment", "solid waste", "liquid waste",
-    "faecal sludge", "menstrual hygiene", "community-led total sanitation",
-    "water quality", "water safety", "sanitation systems", "hygiene education"
+    "Water sanitation and hygiene practices are essential to prevent disease outbreaks",
+    "Toilet and solid waste management should follow safety and hygiene rules",
+    "Handwashing with soap reduces the chances of infection and disease transmission",
+    "Safe drinking water and proper sanitation reduce public health risks",
+    "Personal hygiene is necessary to maintain overall health and prevent infections",
 ]
 
-# Create embeddings for semantic similarity
-embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+WASH_KEYWORDS = {
+    "toilet", "sanitation", " hygiene", "handwash", "sewage", "latrine",
+    "menstrual", "waste", "septic", "cleanliness", "water safety"
+}
 
-# Create documents for WASH domains
-wash_documents = [Document(page_content=domain, metadata={"domain": "wash"}) for domain in WASH_DOMAINS]
+# ----------------------------------------------------
+# LAZY LOADING COMPONENTS
+# ----------------------------------------------------
 
-# Create vector store
-vector_store = FAISS.from_documents(wash_documents, embeddings)
+@lru_cache
+def get_embeddings():
+    logger.info("Loading embedding model...")
+    return HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"token": HF_TOKEN}
+    )
 
-def is_wash_related_query(query, threshold=0.3):
-    """
-    Check if the query is related to WASH sector using semantic similarity
-    """
+@lru_cache
+def get_vector_store():
+    logger.info("Building FAISS vector store...")
+    docs = [Document(page_content=domain, metadata={"label": "wash"}) for domain in WASH_DOMAINS]
+    return FAISS.from_documents(docs, get_embeddings())
+
+@lru_cache
+def get_llm():
+    logger.info("Initializing Groq model...")
+    return ChatGroq(
+        model="llama-3.3-70b-versatile",
+        api_key=GROQ_API_KEY,
+        temperature=0.2,
+        max_tokens=500
+    )
+
+@lru_cache
+def get_search_client():
+    return TavilyClient(api_key=TAVILY_API_KEY)
+
+# ----------------------------------------------------
+# UTILITIES
+# ----------------------------------------------------
+
+def format_response(answer: str, sources: Optional[List[str]] = None, wash_related=True, searched=False) -> Dict:
+    return {
+        "answer": answer.strip(),
+        "sources": sources or [],
+        "is_wash_related": wash_related,
+        "search_performed": searched
+    }
+
+
+def is_wash_query(query: str, threshold: float = 0.55) -> bool:
+    """Check if query belongs to WASH domain via FAISS + keywords."""
+    query = query.lower()
+
+    # Keyword check
+    if any(keyword in query for keyword in WASH_KEYWORDS):
+        logger.info("Keyword matched → Treating as WASH domain.")
+        return True
+
+    # Vector similarity
     try:
-        # Get query embedding
-        query_embedding = embeddings.embed_query(query)
-        query_embedding = np.array(query_embedding).reshape(1, -1)
+        results = get_vector_store().similarity_search_with_score(query, k=1)
+        _, score = results[0]
 
-        # Search for similar documents
-        similar_docs = vector_store.similarity_search_with_score(query, k=3)
+        similarity_score = 1 / (1 + score)  # normalize FAISS score
+        logger.info(f"Similarity score: {similarity_score:.2f}")
 
-        # Check if any similarity score meets the threshold
-        for doc, score in similar_docs:
-            if score >= threshold:
-                return True
-
-        # Additional keyword-based check for safety
-        query_lower = query.lower()
-        wash_keywords = ['sanitation', 'hygiene', 'wash', 'toilet', 'handwash', 'water', 'waste', 'sewage']
-        return any(keyword in query_lower for keyword in wash_keywords)
+        return similarity_score >= threshold
 
     except Exception as e:
-        print(f"Error in similarity check: {e}")
-        # Fallback to keyword matching
-        query_lower = query.lower()
-        wash_keywords = ['sanitation', 'hygiene', 'wash', 'toilet', 'handwash', 'water', 'waste', 'sewage']
-        return any(keyword in query_lower for keyword in wash_keywords)
+        logger.warning(f"Similarity check failed: {e}")
+        return False
 
-# Global variable to store search results
-search_results_cache = {}
 
-# Create the filtered search tool using the @tool decorator
-@tool
-def filtered_search_tool(query: str):
-    """Search for information specifically about sanitation, hygiene, and WASH sector."""
-    # First check if the query is WASH-related
-    if not is_wash_related_query(query):
-        return json.dumps({
-            "search_performed": False, 
-            "results": [], 
-            "message": "Query not related to sanitation, hygiene, or WASH sector."
-        })
+# ----------------------------------------------------
+# AGENT RESPONSE LOGIC
+# ----------------------------------------------------
 
-    # If WASH-related, perform the search
+def generate_response(query: str) -> Dict:
+
+    is_related = is_wash_query(query)
+
+    if not is_related:
+        logger.info("Query is NOT WASH related — using safe response.")
+        return format_response(
+            answer="I can only assist with topics related to sanitation, hygiene, wastewater, toilets, and cleanliness. Please ask in that domain 😊",
+            wash_related=False
+        )
+
+    # First attempt: local domain knowledge
+    logger.info("Generating local contextual response...")
+    llm = get_llm()
+
+    local_prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template=(
+            "You are a WASH specialist assistant.\n"
+            "Provide a clear, helpful, factual answer based ONLY on this information:\n\n"
+            "{context}\n\n"
+            "Question: {question}\n"
+            "If the information is incomplete, respond with what is known but do NOT hallucinate.\n"
+        )
+    )
+
+    context_docs = get_vector_store().similarity_search(query, k=3)
+    context_text = "\n".join([doc.page_content for doc in context_docs])
+
+    local_response = llm.invoke(local_prompt.format(context=context_text, question=query)).content
+
+    # Decide if we need external search
+    if len(local_response) >= 120:  
+        return format_response(answer=local_response)
+
+    # External Search (for factual or updated detail)
+    logger.info("Performing external search...")
+    search_client = get_search_client()
+    search_results = search_client.search(query, max_results=3)
+
+    search_summary = "\n".join(result["content"] for result in search_results.get("results", []))
+
+    search_prompt = PromptTemplate(
+        input_variables=["question", "search_results"],
+        template=(
+            "Based on the verified search results below, provide an accurate, concise answer.\n\n"
+            "Search Results:\n{search_results}\n\n"
+            "Question: {question}\n"
+        )
+    )
+
+    final_answer = llm.invoke(
+        search_prompt.format(question=query, search_results=search_summary)
+    ).content
+
+    return format_response(final_answer, sources=[r.get("url") for r in search_results.get("results", [])], searched=True)
+
+
+# ----------------------------------------------------
+# EXPORT FUNCTION
+# ----------------------------------------------------
+
+def agent(query: str) -> Dict:
+    """Main public method the FastAPI app will call."""
     try:
-        result = search_tool.invoke({"query": query})
-        
-        # Store the search results in cache for source extraction
-        search_results_cache[query] = result
-        
-        # Format the results for the agent
-        formatted_results = []
-        for item in result:
-            formatted_item = {
-                "title": item.get("title", "No title"),
-                "url": item.get("url", "No URL"),
-                "content": item.get("content", "No content")[:200] + "..." if len(item.get("content", "")) > 200 else item.get("content", "No content")
-            }
-            formatted_results.append(formatted_item)
-        
-        return json.dumps({
-            "search_performed": True, 
-            "results": formatted_results,
-            "message": f"Found {len(result)} search results."
-        })
-        
+        return generate_response(query)
     except Exception as e:
-        return json.dumps({
-            "search_performed": False, 
-            "results": [], 
-            "message": f"Search failed: {str(e)}"
-        })
+        logger.error(f"Agent error: {e}")
+        return format_response("Something went wrong. Please try again.", wash_related=True)
 
-# Create tool instance
-filtered_tool = Tool(
-    name="wash_search_tool",
-    description="Search for information specifically about sanitation, hygiene, and WASH sector",
-    func=filtered_search_tool  # Use the tool function directly
-)
 
-# Enhanced system prompt with domain restriction
-system_prompt = """You are a specialized AI chatbot focused exclusively on sanitation, hygiene, and WASH (Water, Sanitation, and Hygiene) sector. 
-
-Your knowledge is strictly limited to:
-- Sanitation systems and technologies
-- Hygiene practices and promotion
-- Water supply and treatment
-- Waste management (solid and liquid)
-- Public health aspects of WASH
-- Community WASH programs
-- WASH-related policies and research
-
-If a query is not related to these topics, you must respond: "I'm specialized in sanitation, hygiene, and WASH sector and don't have knowledge about this topic."
-
-For WASH-related queries, provide accurate, helpful information using your built-in knowledge. Only use the search tool when specifically instructed to search for current information."""
-
-# Create two different agents - one with search and one without
-agent_with_search = create_react_agent(
-    model=groq_llm,
-    tools=[filtered_tool],
-    prompt=system_prompt
-)
-
-# Agent without search tools
-agent_without_search = create_react_agent(
-    model=groq_llm,
-    tools=[],  # No search tools
-    prompt=system_prompt
-)
-
-def get_agent_response(query, allow_web_search=True):
-    """
-    Get response from the WASH-specialized agent
-    """
-
-    # Determine WASH relevance once at the start
-    wash_related_flag = is_wash_related_query(query)
-
-    # If the query is not WASH-related
-    if not wash_related_flag:
-        return {
-            "answer": "I'm specialized in sanitation, hygiene, and WASH sector and don't have knowledge about this topic.",
-            "sources": [],
-            "search_performed": False,
-            "is_wash_related": False
-        }
-
-    # Clear previous search results for this query
-    if query in search_results_cache:
-        del search_results_cache[query]
-
-    # Choose the appropriate agent
-    if allow_web_search:
-        agent_to_use = agent_with_search
-        print("Using agent WITH web search")
-    else:
-        agent_to_use = agent_without_search
-        print("Using agent WITHOUT web search")
-
-    # Process the query
-    state = {"messages": [HumanMessage(content=query)]}
-    try:
-        response = agent_to_use.invoke(state)
-        messages = response.get("messages", [])
-        ai_messages = [msg.content for msg in messages if isinstance(msg, AIMessage)]
-
-        final_response = ai_messages[-1] if ai_messages else "No response generated."
-
-        # Blocked / unrelated WASH response
-        if "Query not related to sanitation" in final_response or \
-           "I can only search for WASH-related" in final_response:
-            
-            return {
-                "answer": "I'm specialized in sanitation, hygiene, and WASH sector and don't have knowledge about this topic.",
-                "sources": [],
-                "search_performed": False,
-                "is_wash_related": wash_related_flag
-            }
-
-        # Extract search results
-        sources = []
-        search_was_performed = False
-        
-        if allow_web_search and query in search_results_cache:
-            search_results = search_results_cache[query]
-            search_was_performed = True
-
-            for i, result in enumerate(search_results):
-                if i >= 2:
-                    break
-                sources.append({
-                    "title": result.get("title", "No title"),
-                    "url": result.get("url", "No URL"),
-                    "content": (
-                        result.get("content", "No content")[:100] + "..."
-                        if len(result.get("content", "")) > 100
-                        else result.get("content", "No content")
-                    )
-                })
-
-        return {
-            "answer": final_response,
-            "sources": sources,
-            "search_performed": search_was_performed,
-            "is_wash_related": wash_related_flag
-        }
-
-    except Exception as e:
-        return {
-            "answer": f"Error processing query: {str(e)}",
-            "sources": [],
-            "search_performed": False,
-            "is_wash_related": wash_related_flag
-        }
-
-# Test the agent
-print("Testing the WASH-specialized agent...")
