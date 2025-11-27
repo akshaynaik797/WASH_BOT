@@ -2,9 +2,7 @@ fastapi
 uvicorn[standard]
 python-dotenv
 requests
-streamlit
 faster-whisper
-streamlit-mic-recorder
 langchain
 langchain-community
 langchain-groq
@@ -14,4 +12,5 @@ sentence-transformers
 numpy
 scikit-learn
 tavily-python
+
 
