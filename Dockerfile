@@ -1,7 +1,7 @@
 # ---------------------------
 # Base Image
 # ---------------------------
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 # Prevent Python from writing .pyc files and buffering logs
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -48,3 +48,4 @@ HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
 # Start Uvicorn server with longer timeout
 # ---------------------------
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-keep-alive", "300"]
+
