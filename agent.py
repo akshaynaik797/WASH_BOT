@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, Optional
 
 from langchain_groq import ChatGroq
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain.prompts import PromptTemplate
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.vectorstores import FAISS
@@ -182,5 +182,6 @@ def agent(query: str) -> Dict:
     except Exception as e:
         logger.error(f"Agent error: {e}")
         return format_response("Something went wrong. Please try again.", wash_related=True)
+
 
 
