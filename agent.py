@@ -10,6 +10,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
+
 from tavily import TavilyClient
 
 # ----------------------------------------------------
