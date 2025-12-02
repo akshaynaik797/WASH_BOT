@@ -1,0 +1,24 @@
+ steps:
+ # Build the container image
+ - name: 'gcr.io/cloud-builders/docker'
+   args: ['build', '-t', 'asia-south1-docker.pkg.dev/$PROJECT_ID/applications/$_APPL_ENV:$COMMIT_SHA', '.']
+ # Push the container image to Container Registry
+ - name: 'gcr.io/cloud-builders/docker'
+   args: ['push', 'asia-south1-docker.pkg.dev/$PROJECT_ID/applications/$_APPL_ENV:$COMMIT_SHA']
+ # Deploy container image to Cloud Run
+ - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+   entrypoint: gcloud
+   args:
+   - 'run'
+   - 'deploy'
+   - '${_APPL_ENV}'
+   - '--image'
+   - 'asia-south1-docker.pkg.dev/$PROJECT_ID/applications/$_APPL_ENV:$COMMIT_SHA'
+   - '--region'
+   - 'asia-south1'
+   - '--allow-unauthenticated'
+   
+ images:
+ - 'asia-south1-docker.pkg.dev/$PROJECT_ID/applications/$_APPL_ENV:$COMMIT_SHA'
+ options:
+  logging: CLOUD_LOGGING_ONLY
